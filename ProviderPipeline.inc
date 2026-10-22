@@ -33,6 +33,7 @@ static void DateLyricsMusixmatchRequest(DateLyricsMusixmatchTask *owner, NSStrin
         NSURLSessionConfiguration *configuration = [NSURLSessionConfiguration ephemeralSessionConfiguration];
         // datelyrics owns the finite wall-clock deadline below. unlimited removes
         // that deadline; transport errors and system limits still apply.
+        configuration.HTTPMaximumConnectionsPerHost = 2;
         configuration.timeoutIntervalForRequest = 365.0 * 24.0 * 60.0 * 60.0;
         configuration.timeoutIntervalForResource = configuration.timeoutIntervalForRequest;
         gDateLyricsProviderSession = [NSURLSession sessionWithConfiguration:configuration];
@@ -596,24 +597,12 @@ static BOOL DateLyricsSerializeMusixmatchLines(NSInteger storeID, NSArray<DateLy
 }
 
 
-static void DateLyricsWriteMusixmatchLoadingScore(DateLyricsMusixmatchTask *task, NSInteger step, NSInteger total) {
-    // presentation belongs to the client; loading is never cached as lyrics.
-}
-
-// delay the loading indicator so short lookups never flicker. keep it visible
-// until the lookup finishes or is cancelled; provider retries can take longer
-// than a single request. apple line-timed upgrades never show "loading…".
 static BOOL DateLyricsMusixmatchTaskIsCurrent(DateLyricsMusixmatchTask *task);
 
 static void DateLyricsMusixmatchFinishTask(DateLyricsMusixmatchTask *task, NSString *reason);
-static void DateLyricsLRCLIBFetch(DateLyricsMusixmatchTask *task);
-static void DateLyricsMegalobizFetch(DateLyricsMusixmatchTask *task);
-static void DateLyricsNetEaseFetch(DateLyricsMusixmatchTask *task);
-static void DateLyricsQQMusicFetch(DateLyricsMusixmatchTask *task);
 static void DateLyricsMusixmatchEnsureToken(DateLyricsMusixmatchTask *task, BOOL forceRefresh);
 static NSDictionary *DateLyricsMusixmatchJSON(NSData *data);
 static void DateLyricsStepFallback(DateLyricsMusixmatchTask *task, NSString *reason);
-static void DateLyricsFinalizeFallbackTask(DateLyricsMusixmatchTask *task, NSString *reason);
 
 static NSString *DateLyricsUnescapeLRC(NSString *lrc) {
     if (!lrc || lrc.length == 0) return @"";
@@ -630,69 +619,20 @@ static NSString *DateLyricsUnescapeLRC(NSString *lrc) {
     return clean;
 }
 
-static void DateLyricsFinalizeFallbackTask(DateLyricsMusixmatchTask *task, NSString *reason) {
+static void DateLyricsStepFallback(DateLyricsMusixmatchTask *task, NSString *reason) {
     DLCFinishTask(task, reason);
 }
-
-static void DateLyricsStepFallback(DateLyricsMusixmatchTask *task, NSString *reason) {
-    if (!task || !DateLyricsMusixmatchTaskIsCurrent(task)) return;
-
-    if (task.hasWordTiming || (task.hasUsableLines && !gDateLyricsWordHighlighting)) {
-        DateLyricsFinalizeFallbackTask(task, nil);
-        return;
-    }
-    NSArray<NSString *> *active = DateLyricsActiveProviders();
-    task.totalProviders = active.count;
-    if (!task.attemptedProviders) task.attemptedProviders = [NSMutableSet set];
-
-    for (NSUInteger i = 0; i < active.count; i++) {
-        NSString *providerKey = active[i];
-        if ([task.attemptedProviders containsObject:providerKey]) continue;
-        if (task.hasUsableLines && !DateLyricsProviderHasWordTiming(providerKey)) continue;
-        [task.attemptedProviders addObject:providerKey];
-        NSInteger step = (NSInteger)(i + 1);
-        task.currentProviderIndex = step;
-        task.provider = providerKey;
-        task.searchQueries = DateLyricsProviderQueries(task);
-        task.searchIndex = 0;
-        task.searchedURLs = [NSMutableSet set];
-        task.matchedTrack = nil;
-        task.candidates = nil;
-        task.candidateIndex = 0;
-        task.candidateFetches = 0;
-        task.attemptedCandidates = [NSMutableSet set];
-        if (task.hasShownLoading || step > 1) {
-            task.hasShownLoading = YES;
-            DateLyricsWriteMusixmatchLoadingScore(task, step, task.totalProviders);
-        }
-        DateLyricsDebugLog(@"[Provider:STEP] storeID=%ld provider=%@ step=%ld total=%ld attempted=%lu reason=%@",
-            (long)task.storeID, providerKey, (long)step,
-            (long)task.totalProviders, (unsigned long)task.attemptedProviders.count, reason ?: @"initial");
-        if ([providerKey isEqualToString:@"musixmatch"]) {
-            DateLyricsMusixmatchEnsureToken(task, NO);
-        } else if ([providerKey isEqualToString:@"lrclib"]) {
-            DateLyricsLRCLIBFetch(task);
-        } else if ([providerKey isEqualToString:@"megalobiz"]) {
-            DateLyricsMegalobizFetch(task);
-        } else if ([providerKey isEqualToString:@"netease"]) {
-            DateLyricsNetEaseFetch(task);
-        } else if ([providerKey isEqualToString:@"qqmusic"]) {
-            DateLyricsQQMusicFetch(task);
-        }
-        return;
-    }
-
-    DateLyricsFinalizeFallbackTask(task, task.hasUsableLines ? nil : (reason ?: @"All lyric providers exhausted"));
-}
-
 static void DateLyricsMusixmatchFinishTask(DateLyricsMusixmatchTask *task, NSString *reason) {
-    if (!task) return;
-    if (!DateLyricsMusixmatchTaskIsCurrent(task)) return;
-    if (reason.length > 0) {
-        DateLyricsStepFallback(task, reason);
-    } else {
-        DateLyricsFinalizeFallbackTask(task, nil);
-    }
+    DLCFinishTask(task, reason);
+}
+static void DateLyricsProviderSearch(DateLyricsMusixmatchTask *task);
+static void DateLyricsStartProvider(DateLyricsMusixmatchTask *task) {
+    task.searchQueries = DateLyricsProviderQueries(task);
+    task.searchedURLs = [NSMutableSet set];
+    task.attemptedCandidates = [NSMutableSet set];
+    DateLyricsDebugLog(@"[Provider:START] storeID=%ld provider=%@", (long)task.storeID, task.provider);
+    if ([task.provider isEqualToString:@"musixmatch"]) DateLyricsMusixmatchEnsureToken(task, NO);
+    else DateLyricsProviderSearch(task);
 }
 
 // providers share discovery, ranking and a three-candidate fetch budget.
@@ -963,22 +903,6 @@ static void DateLyricsProviderSearch(DateLyricsMusixmatchTask *task) {
         return;
     }
     DateLyricsStepFallback(task, @"Provider has no trustworthy synchronized lyrics");
-}
-
-static void DateLyricsLRCLIBFetch(DateLyricsMusixmatchTask *task) {
-    if (DateLyricsMusixmatchTaskIsCurrent(task) && DateLyricsLRCLIBServiceEnabled()) DateLyricsProviderSearch(task);
-}
-
-static void DateLyricsMegalobizFetch(DateLyricsMusixmatchTask *task) {
-    if (DateLyricsMusixmatchTaskIsCurrent(task) && DateLyricsMegalobizServiceEnabled()) DateLyricsProviderSearch(task);
-}
-
-static void DateLyricsNetEaseFetch(DateLyricsMusixmatchTask *task) {
-    if (DateLyricsMusixmatchTaskIsCurrent(task) && DateLyricsNetEaseServiceEnabled()) DateLyricsProviderSearch(task);
-}
-
-static void DateLyricsQQMusicFetch(DateLyricsMusixmatchTask *task) {
-    if (DateLyricsMusixmatchTaskIsCurrent(task) && DateLyricsQQMusicServiceEnabled()) DateLyricsProviderSearch(task);
 }
 
 static BOOL DateLyricsMusixmatchTaskIsCurrent(DateLyricsMusixmatchTask *task) {

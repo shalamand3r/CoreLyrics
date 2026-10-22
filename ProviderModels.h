@@ -17,10 +17,6 @@ typedef NS_ENUM(NSInteger, DateLyricsSyncTier) { DateLyricsSyncTierNone, DateLyr
 @property (nonatomic, assign) NSUInteger cacheGeneration;
 @property (nonatomic, assign) NSUInteger musixmatchGeneration;
 @property (nonatomic, copy) NSString *taskID;
-@property (nonatomic, strong) NSMutableSet<NSString *> *attemptedProviders;
-@property (nonatomic, assign) BOOL hasShownLoading;
-@property (nonatomic, assign) NSInteger currentProviderIndex;
-@property (nonatomic, assign) NSInteger totalProviders;
 @property (nonatomic, copy) NSString *provider;
 @property (nonatomic, copy) NSArray<NSDictionary *> *searchQueries;
 @property (nonatomic, assign) NSUInteger searchIndex;
