@@ -1,0 +1,29 @@
+#!/bin/sh
+# copy owned legacy caches before replacement; keep originals and newer entries.
+for library in /var/mobile/Library /var/jb/var/mobile/Library /var/mobile/Containers/Data/Application/*/Library; do
+    [ -d "$library" ] && [ ! -L "$library" ] || continue
+    case "$library" in
+        */Containers/Data/Application/*/Library)
+            [ ! -L "${library%/Library}" ] || continue ;;
+    esac
+    current="$library/CoreLyrics"
+    [ ! -L "$current" ] || continue
+    for legacy in "$library/DateLyrics"; do
+        [ -d "$legacy" ] && [ ! -L "$legacy" ] || continue
+        for entry in "$legacy"/*.json; do
+            [ -f "$entry" ] && [ ! -L "$entry" ] || continue
+            # datelyrics score files remain for metadata-aware runtime adoption.
+            [ "${entry##*/}" = musixmatch-token.json ] || continue
+            mkdir -p "$current" || exit 1
+            destination="$current/${entry##*/}"
+            [ ! -e "$destination" ] && [ ! -L "$destination" ] || continue
+            cp -p "$entry" "$destination" || exit 1
+            chown mobile:mobile "$destination" 2>/dev/null || true
+        done
+    done
+    if [ -d "$current" ]; then
+        chown mobile:mobile "$current" 2>/dev/null || true
+        chmod 755 "$current" 2>/dev/null || true
+    fi
+done
+exit 0

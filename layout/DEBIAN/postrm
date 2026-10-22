@@ -1,0 +1,19 @@
+#!/bin/sh
+# upgrade keeps cached and saved lyrics; final core removal cleans owned data.
+case "$1" in
+    remove|purge)
+        for target in /var/mobile/Library/CoreLyrics /var/jb/var/mobile/Library/CoreLyrics; do
+            if [ -d "$target" ] && [ ! -L "$target" ]; then rm -rf "$target"; fi
+            if [ -L "$target" ]; then rm -f "$target"; fi
+        done
+        for container in /var/mobile/Containers/Data/Application/*; do
+            for target in "$container/Library/CoreLyrics"; do
+                if [ ! -L "$container" ] && [ ! -L "$container/Library" ] && \
+                   [ -d "$target" ] && [ ! -L "$target" ]; then
+                    rm -rf "$target"
+                fi
+            done
+        done
+        ;;
+esac
+exit 0

@@ -1,0 +1,9 @@
+.theos/
+packages/
+*.deb
+*.log
+*.ips
+.DS_Store
+__pycache__/
+research/captures/
+.env
