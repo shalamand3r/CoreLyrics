@@ -411,9 +411,8 @@ static void DLCLoadPreferences(void) {
     gDateLyricsRequestTimeout = DateLyricsSanitizedRequestTimeout(DLCPreference(@"LyricsRequestTimeout"));
     NSDictionary *bridge = DLLyricsSavedPreferences(@"com.shalamand3r.lyricbridge");
     id bridgeDebug = DLLyricsPreferenceValue(@"com.shalamand3r.lyricbridge", @"DebugLogging", bridge);
-    id bridgePerformance = DLLyricsPreferenceValue(@"com.shalamand3r.lyricbridge", @"PerformanceLogging", bridge);
     gDateLyricsDebugLogging = DLCPreferenceBool(@"DebugLogging", NO) || ([bridgeDebug isKindOfClass:NSNumber.class] && [bridgeDebug boolValue]);
-    gPerformanceLogging = [bridgePerformance isKindOfClass:NSNumber.class] && [bridgePerformance boolValue];
+    gPerformanceLogging = gDateLyricsDebugLogging;
     NSString *token = DateLyricsJSONString(DLCPreference(@"MusixmatchUserToken"));
     token = [token stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
     if (![token ?: @"" isEqualToString:gDateLyricsMusixmatchCustomUserToken ?: @""]) {
