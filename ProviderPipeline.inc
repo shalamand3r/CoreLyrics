@@ -42,8 +42,8 @@ static void DateLyricsMusixmatchRequest(DateLyricsMusixmatchTask *owner, NSStrin
     NSString *requestKey = owner.taskID ?: @"token";
     DateLyricsCancelProviderRequest(requestKey);
     NSInteger timeout = gDateLyricsRequestTimeout;
-    CFTimeInterval startedAt = gDateLyricsDebugLogging ? CACurrentMediaTime() : 0.0;
-    DateLyricsDebugLog(@"[Provider:HTTP] begin host=%@ path=%@ timeout=%@", url.host ?: @"?", url.path ?: @"/", DateLyricsRequestTimeoutLabel(timeout));
+    CFTimeInterval startedAt = (gDateLyricsDebugLogging || gPerformanceLogging) ? CACurrentMediaTime() : 0.0;
+    DateLyricsDebugLog(@"[Provider:HTTP] begin host=%@ timeout=%@", url.host ?: @"?", DateLyricsRequestTimeoutLabel(timeout));
     NSMutableURLRequest *request = DateLyricsProviderURLRequest(url);
     request.timeoutInterval = 365.0 * 24.0 * 60.0 * 60.0;
     request.cachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
@@ -62,10 +62,11 @@ static void DateLyricsMusixmatchRequest(DateLyricsMusixmatchTask *owner, NSStrin
             [gDateLyricsProviderRequests removeObjectForKey:requestKey];
             NSHTTPURLResponse *http = [response isKindOfClass:NSHTTPURLResponse.class] ? (NSHTTPURLResponse *)response : nil;
             NSError *resultError = expired ? [NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorTimedOut userInfo:nil] : error;
-            DateLyricsDebugLog(@"[Provider:HTTP] end host=%@ path=%@ status=%ld bytes=%lu seconds=%.3f errorDomain=%@ errorCode=%ld",
-                               url.host ?: @"?", url.path ?: @"/", (long)http.statusCode, (unsigned long)data.length,
+            DateLyricsDebugLog(@"[Provider:HTTP] end host=%@ status=%ld bytes=%lu seconds=%.3f errorCode=%ld",
+                               url.host ?: @"?", (long)http.statusCode, (unsigned long)data.length,
                                startedAt > 0.0 ? CACurrentMediaTime() - startedAt : -1.0,
-                               resultError.domain ?: @"none", (long)resultError.code);
+                               (long)resultError.code);
+            if (gPerformanceLogging) CLDiagnosticAppend(DLCCacheRoot(), @"CoreLyrics", YES, [NSString stringWithFormat:@"event=http-finish host=%@ status=%ld bytes=%lu seconds=%.3f errorCode=%ld", url.host, (long)http.statusCode, (unsigned long)data.length, CACurrentMediaTime() - startedAt, (long)resultError.code]);
             if (owner && (resultError || http.statusCode == 429 || http.statusCode >= 500)) owner.hadTransportFailure = YES;
             if (completion) completion(expired ? nil : data, http.statusCode, resultError);
         });
@@ -311,8 +312,8 @@ static BOOL DateLyricsProviderTrackIsTrusted(NSString *title, NSString *artist, 
         fuzzyTitle = !isShortTitle && artistMatches && DateLyricsFuzzyTitleMatches(task.title, title);
     }
     if ((!titleMatches || !artistMatches) && !fuzzyArtist && !fuzzyTitle) {
-        DateLyricsDebugLog(@"[Provider:MATCH] reject storeID=%ld title=%d artist=%d relaxed=%d isShortTitle=%d reason=identity (candidate='%@' / '%@' wanted='%@' / '%@')",
-            (long)task.storeID, titleMatches, artistMatches, gDateLyricsRelaxedMatching, isShortTitle, title ?: @"", artist ?: @"", task.title ?: @"", task.artist ?: @"");
+        DateLyricsDebugLog(@"[Provider:MATCH] reject storeID=%ld title=%d artist=%d relaxed=%d isShortTitle=%d reason=identity",
+            (long)task.storeID, titleMatches, artistMatches, gDateLyricsRelaxedMatching, isShortTitle);
         return NO;
     }
     // limit max duration difference across all services: reject if delta > 6.0s
@@ -1021,7 +1022,7 @@ static void DateLyricsMusixmatchFinishTokenLoad(NSString *token, NSString *reaso
     } else {
         gMusixmatchUserToken = nil;
         gMusixmatchTokenFetchedAt = 0.0;
-        DateLyricsDebugLog(@"[Musixmatch] anonymous token unavailable: %@", reason ?: @"unknown response");
+        DateLyricsDebugLog(@"[Musixmatch] anonymous token unavailable");
     }
 
     NSArray<DateLyricsMusixmatchTask *> *tasks = [gMusixmatchTokenWaiters copy];
@@ -1131,8 +1132,7 @@ static void DateLyricsMusixmatchFetchRichsync(DateLyricsMusixmatchTask *task) {
         @"commontrack_id": @(task.commontrackID),
         @"usertoken": gMusixmatchUserToken ?: @""
     });
-    DateLyricsDebugLog(@"[Musixmatch] requesting rich-sync storeID=%ld commontrack=%ld",
-                       (long)task.storeID, (long)task.commontrackID);
+    DateLyricsDebugLog(@"[Musixmatch] requesting rich-sync request=%ld", (long)task.storeID);
     DateLyricsMusixmatchRequest(task, url, DateLyricsMusixmatchHeaders(), ^(NSData *data, NSInteger status, NSError *error) {
         dispatch_async(gLyricsQueue, ^{
             if (!DateLyricsMusixmatchTaskIsCurrent(task)) {
@@ -1188,8 +1188,8 @@ static void DateLyricsMusixmatchFetchMacro(DateLyricsMusixmatchTask *task) {
         @"q_duration": task.duration > 0.0 ? @((NSInteger)llround(task.duration)) : @"",
         @"usertoken": gMusixmatchUserToken
     };
-    DateLyricsDebugLog(@"[Musixmatch] matching storeID=%ld title=%@ artist=%@ duration=%.0f",
-                       (long)task.storeID, queryTitle, queryArtist, task.duration);
+    DateLyricsDebugLog(@"[Musixmatch] matching request=%ld duration=%.0f",
+                       (long)task.storeID, task.duration);
     DateLyricsMusixmatchRequest(task, DateLyricsMusixmatchURL(@"macro.subtitles.get", parameters),
                                 DateLyricsMusixmatchHeaders(),
                                 ^(NSData *data, NSInteger status, NSError *error) {
@@ -1229,13 +1229,9 @@ static void DateLyricsMusixmatchFetchMacro(DateLyricsMusixmatchTask *task) {
                     DateLyricsDebugLog(@"[Musixmatch] reject storeID=%ld reason=no-track-in-response",
                                        (long)task.storeID);
                 } else if (DateLyricsJSONNumber(track[@"instrumental"]).boolValue) {
-                    DateLyricsDebugLog(@"[Musixmatch] reject storeID=%ld reason=flagged-instrumental candidate='%@' / '%@'",
-                                       (long)task.storeID, track[@"track_name"] ?: @"?", track[@"artist_name"] ?: @"?");
+                    DateLyricsDebugLog(@"[Musixmatch] reject request=%ld reason=flagged-instrumental", (long)task.storeID);
                 } else {
-                    DateLyricsDebugLog(@"[Musixmatch] reject storeID=%ld reason=untrusted-match "
-                                        "candidate='%@' / '%@' len=%@ ours='%@' / '%@' len=%.0f",
-                                       (long)task.storeID, track[@"track_name"] ?: @"?", track[@"artist_name"] ?: @"?",
-                                       track[@"track_length"] ?: @"?", task.title ?: @"", task.artist ?: @"", task.duration);
+                    DateLyricsDebugLog(@"[Musixmatch] reject request=%ld reason=untrusted-match duration=%.0f", (long)task.storeID, task.duration);
                 }
                 DateLyricsMusixmatchFinishTask(task, @"No trustworthy non-instrumental match");
                 return;
@@ -1246,9 +1242,7 @@ static void DateLyricsMusixmatchFetchMacro(DateLyricsMusixmatchTask *task) {
             id subtitleBody = DateLyricsMusixmatchFindJSONValue(json, @"subtitle_body");
             task.subtitleBody = [subtitleBody isKindOfClass:NSString.class] ? subtitleBody : nil;
             BOOL hasRichsync = DateLyricsJSONNumber(track[@"has_richsync"]).boolValue;
-            DateLyricsDebugLog(@"[Musixmatch] matched title=%@ artist=%@ commontrack=%ld richsync=%d subtitle=%d",
-                               track[@"track_name"] ?: @"", track[@"artist_name"] ?: @"",
-                               (long)task.commontrackID, hasRichsync, task.subtitleBody.length > 0);
+            DateLyricsDebugLog(@"[Musixmatch] matched request=%ld richsync=%d subtitle=%d", (long)task.storeID, hasRichsync, task.subtitleBody.length > 0);
             DateLyricsMusixmatchPublishSubtitle(task);
             if (!DateLyricsMusixmatchTaskIsCurrent(task)) return;
             NSString *candidateID = [NSString stringWithFormat:@"%ld", (long)task.commontrackID];

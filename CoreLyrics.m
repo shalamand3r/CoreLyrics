@@ -7,6 +7,7 @@
 #import "DateLyricsFetchSettings.h"
 #import "DateLyricsProviderTiming.h"
 #import "CoreLyricsPaths.h"
+#import "CoreLyricsDiagnostics.h"
 #import <CommonCrypto/CommonDigest.h>
 #import <QuartzCore/QuartzCore.h>
 #import <ctype.h>
@@ -14,6 +15,7 @@
 #import <sys/file.h>
 #import <fcntl.h>
 #import <unistd.h>
+#import <sys/resource.h>
 
 #define DateLyricsMusixmatchTask DLCoreProviderTask
 #define DateLyricsTimedLine DLCoreLine
@@ -35,6 +37,8 @@
 @property (nonatomic, strong) NSMutableDictionary<NSNumber *, DLCoreProviderTask *> *tasks;
 @property (nonatomic, copy) NSArray<NSString *> *providers;
 @property (nonatomic) NSUInteger nextProvider;
+@property (nonatomic) NSTimeInterval startedAt;
+@property (nonatomic) double startedCPU;
 @property (nonatomic) BOOL parallelReady;
 @property (nonatomic) NSUInteger hedgeGeneration;
 @property (nonatomic) BOOL hadTransportFailure;
@@ -59,6 +63,7 @@ static NSTimeInterval gMusixmatchTokenFetchedAt;
 static NSUInteger gDateLyricsMusixmatchGeneration, gTokenGeneration;
 static NSInteger gNextLookupID;
 static BOOL gDateLyricsDebugLogging = NO;
+static BOOL gPerformanceLogging;
 static BOOL gDateLyricsMusixmatchEnabled = YES, gDateLyricsWordHighlighting = YES;
 static BOOL gDateLyricsRelaxedMatching;
 static NSInteger gDateLyricsRequestTimeout = 10;
@@ -68,6 +73,7 @@ static NSDictionary *gSavedProviderPreferences;
 static NSString *DLCCacheRoot(void);
 static NSData *DLCReadTokenCache(void);
 static void DLCLog(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
+static void DLCPerformance(NSString *event, DLCoreLookup *lookup);
 static void DLCPruneCache(void);
 static BOOL DLCPublishLines(NSInteger lookupID, NSArray<DLCoreLine *> *lines, BOOL relaxed);
 static void DLCFinishTask(DLCoreProviderTask *task, NSString *reason);
@@ -184,19 +190,20 @@ static NSData *DLCReadTokenCache(void) {
 }
 static void DLCLog(NSString *format, ...) {
     va_list arguments; va_start(arguments, format);
-    NSString *message = [[NSString alloc] initWithFormat:format arguments:arguments];
-    va_end(arguments);
-    NSString *root = DLCCacheRoot();
-    [NSFileManager.defaultManager createDirectoryAtPath:root withIntermediateDirectories:YES attributes:nil error:nil];
-    NSString *path = [root stringByAppendingPathComponent:@"diagnostics.log"];
-    if ([[NSFileManager.defaultManager attributesOfItemAtPath:path error:nil] fileSize] > 65536)
-        [NSFileManager.defaultManager removeItemAtPath:path error:nil];
-    NSData *data = [[message stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding];
-    NSFileHandle *file = [NSFileHandle fileHandleForWritingAtPath:path];
-    if (!file) { [data writeToFile:path atomically:YES]; return; }
-    @try { [file seekToEndOfFile]; [file writeData:data]; }
-    @catch (__unused NSException *exception) {}
-    @finally { [file closeFile]; }
+    NSString *message = [[NSString alloc] initWithFormat:format arguments:arguments]; va_end(arguments);
+    CLDiagnosticAppend(DLCCacheRoot(), @"CoreLyrics", NO, message);
+}
+static double DLCProcessCPU(void) {
+    struct rusage usage; if (getrusage(RUSAGE_SELF, &usage) != 0) return 0;
+    return usage.ru_utime.tv_sec + usage.ru_utime.tv_usec/1e6 + usage.ru_stime.tv_sec + usage.ru_stime.tv_usec/1e6;
+}
+static void DLCPerformance(NSString *event, DLCoreLookup *lookup) {
+    if (!gPerformanceLogging) return;
+    CLDiagnosticAppend(DLCCacheRoot(), @"CoreLyrics", YES,
+        [NSString stringWithFormat:@"event=%@ elapsed=%.3f activeProviders=%lu subscribers=%lu lines=%lu words=%d processCpuDelta=%.6f", event,
+            lookup.startedAt > 0 ? CACurrentMediaTime() - lookup.startedAt : 0,
+            (unsigned long)lookup.tasks.count, (unsigned long)lookup.subscribers.count,
+            (unsigned long)lookup.result.lines.count, lookup.result.hasWordTiming, lookup.startedCPU > 0 ? MAX(0, DLCProcessCPU()-lookup.startedCPU) : 0]);
 }
 static NSArray *DLCValidatedLines(id raw) {
     if (![raw isKindOfClass:NSArray.class] || ![raw count] || [raw count] > 4000) return nil;
@@ -292,13 +299,15 @@ static BOOL DLCPublishLines(NSInteger lookupID, NSArray<DLCoreLine *> *lines, BO
     for (NSDictionary *line in valid) result.hasWordTiming |= [line[@"words"] count] > 0;
     if (lookup.result.hasWordTiming || (lookup.result && !result.hasWordTiming)) return NO;
     lookup.result = result;
+    DLCPerformance(result.hasWordTiming ? @"word-upgrade" : @"first-lines", lookup);
     DLCNotify(lookup, NO, nil);
     for (DLCoreProviderTask *task in lookup.tasks.allValues) {
         task.hasUsableLines = YES;
         task.hasWordTiming = result.hasWordTiming;
     }
     if (result.hasWordTiming) DLCCompleteLookup(lookup, nil);
-    DLCWriteCache(lookup.track, result, YES);
+    if (DLCWriteCache(lookup.track, result, YES))
+        CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(), CFSTR("com.shalamand3r.corelyrics/CacheUpdated"), NULL, NULL, YES);
     static NSTimeInterval nextPrune;
     if (NSDate.date.timeIntervalSince1970 >= nextPrune) {
         nextPrune = NSDate.date.timeIntervalSince1970 + 3600;
@@ -318,6 +327,7 @@ static BOOL DLCPublishLines(NSInteger lookupID, NSArray<DLCoreLine *> *lines, BO
     return YES;
 }
 static void DLCCancelLookup(DLCoreLookup *lookup) {
+    DLCPerformance(@"cancel-remaining", lookup);
     for (DLCoreProviderTask *task in lookup.tasks.allValues) {
         DateLyricsCancelProviderLookup(task.storeID);
         [gLookupIDs removeObjectForKey:@(task.storeID)];
@@ -330,6 +340,8 @@ static void DLCCompleteLookup(DLCoreLookup *lookup, NSString *reason) {
     if (reason.length && !lookup.result)
         gRetryAfter[lookup.track.cacheKey] = @(NSDate.date.timeIntervalSince1970 + (lookup.hadTransportFailure ? 30 : 900));
     NSError *error = reason.length && !lookup.result ? [NSError errorWithDomain:@"CoreLyrics" code:1 userInfo:@{NSLocalizedDescriptionKey:reason}] : nil;
+    DLCPerformance(error ? @"finished-no-result" : @"finished", lookup);
+    DateLyricsDebugLog(@"[Lookup:FINISH] result=%d transportFailure=%d", lookup.result != nil, lookup.hadTransportFailure);
     DLCNotify(lookup, YES, error);
     DLCCancelLookup(lookup);
     [lookup.subscribers removeAllObjects];
@@ -342,6 +354,7 @@ static void DLCArmHedge(DLCoreLookup *lookup) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 350 * NSEC_PER_MSEC), gLyricsQueue, ^{
         DLCoreLookup *active = weakLookup;
         if (!active || gLookups[active.track.cacheKey] != active || active.hedgeGeneration != generation) return;
+        DLCPerformance(@"start-overlap", active);
         active.parallelReady = YES;
         DLCFillProviders(active);
     });
@@ -370,6 +383,7 @@ static void DLCFillProviders(DLCoreLookup *lookup) {
 static void DLCFinishTask(DLCoreProviderTask *task, NSString *reason) {
     if (!DateLyricsMusixmatchTaskIsCurrent(task)) return;
     DLCoreLookup *lookup = gLookupIDs[@(task.storeID)];
+    DateLyricsDebugLog(@"[Provider:FINISH] request=%ld provider=%@ failed=%d transportFailure=%d", (long)task.storeID, task.provider, reason.length > 0, task.hadTransportFailure);
     lookup.hadTransportFailure |= task.hadTransportFailure;
     if (reason.length) lookup.failureReason = reason;
     DateLyricsCancelProviderLookup(task.storeID);
@@ -395,7 +409,11 @@ static void DLCLoadPreferences(void) {
     gDateLyricsMusixmatchEnabled = DLCPreferenceBool(@"MusixmatchEnabled", YES);
     gDateLyricsRelaxedMatching = DLCPreferenceBool(@"RelaxedMatching", NO);
     gDateLyricsRequestTimeout = DateLyricsSanitizedRequestTimeout(DLCPreference(@"LyricsRequestTimeout"));
-    gDateLyricsDebugLogging = DLCPreferenceBool(@"DebugLogging", NO);
+    NSDictionary *bridge = DLLyricsSavedPreferences(@"com.shalamand3r.lyricbridge");
+    id bridgeDebug = DLLyricsPreferenceValue(@"com.shalamand3r.lyricbridge", @"DebugLogging", bridge);
+    id bridgePerformance = DLLyricsPreferenceValue(@"com.shalamand3r.lyricbridge", @"PerformanceLogging", bridge);
+    gDateLyricsDebugLogging = DLCPreferenceBool(@"DebugLogging", NO) || ([bridgeDebug isKindOfClass:NSNumber.class] && [bridgeDebug boolValue]);
+    gPerformanceLogging = [bridgePerformance isKindOfClass:NSNumber.class] && [bridgePerformance boolValue];
     NSString *token = DateLyricsJSONString(DLCPreference(@"MusixmatchUserToken"));
     token = [token stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
     if (![token ?: @"" isEqualToString:gDateLyricsMusixmatchCustomUserToken ?: @""]) {
@@ -530,13 +548,15 @@ static void DLCCacheResetRequested(CFNotificationCenterRef center, void *observe
             return;
         }
         DLLyricsResult *cached = DLCReadCache(selection);
+        DateLyricsDebugLog(@"[Cache:READ] hit=%d words=%d durationKnown=%d", cached != nil, cached.hasWordTiming, selection.duration > 0);
         if (cached.hasWordTiming || (!gDateLyricsMusixmatchEnabled && cached)) {
             dispatch_async(dispatch_get_main_queue(), ^{ delivery(cached, YES, nil); }); return;
         }
         if ([gRetryAfter[key] doubleValue] > NSDate.date.timeIntervalSince1970 || !gDateLyricsMusixmatchEnabled) {
             dispatch_async(dispatch_get_main_queue(), ^{ delivery(cached, YES, cached ? nil : [NSError errorWithDomain:@"CoreLyrics" code:3 userInfo:@{NSLocalizedDescriptionKey:@"No cached lyrics are available."}]); }); return;
         }
-        lookup = [DLCoreLookup new]; lookup.track = selection; lookup.result = cached;
+        lookup = [DLCoreLookup new]; lookup.startedAt = CACurrentMediaTime(); lookup.startedCPU = gPerformanceLogging ? DLCProcessCPU() : 0; lookup.track = selection; lookup.result = cached;
+        DLCPerformance(@"lookup-start", lookup);
         lookup.subscribers = [NSMutableDictionary dictionaryWithObject:delivery forKey:token];
         lookup.tasks = [NSMutableDictionary dictionary]; lookup.providers = [DateLyricsActiveProviders() copy];
         gLookups[key] = lookup;
