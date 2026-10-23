@@ -32,7 +32,10 @@
 @interface DLLyricsSubscription ()
 @property (nonatomic, copy) dispatch_block_t cancellation;
 @end
+@class DLCSharedLease;
 @interface DLCoreLookup : NSObject
+@property (nonatomic, strong) DLCSharedLease *sharedLease;
+@property (nonatomic, copy) NSString *cacheEpoch;
 @property (nonatomic, strong) DLLyricsTrack *track;
 @property (nonatomic, strong) NSMutableDictionary<NSNumber *, DLCoreProviderTask *> *tasks;
 @property (nonatomic, copy) NSArray<NSString *> *providers;
@@ -85,6 +88,8 @@ static void DLCFinishTask(DLCoreProviderTask *task, NSString *reason);
 static void DLCCompleteLookup(DLCoreLookup *lookup, NSString *reason);
 static void DLCFillProviders(DLCoreLookup *lookup);
 static void DLCArmHedge(DLCoreLookup *lookup);
+static void DLCCancelLookup(DLCoreLookup *lookup);
+static NSArray *DLCFetchConfiguration(void);
 static void DateLyricsAssignCharacterRanges(DLCoreLine *line) { (void)line; }
 static BOOL DateLyricsMusixmatchServiceEnabled(void) { return [gDateLyricsProviderOrder containsObject:@"musixmatch"]; }
 static NSArray *DateLyricsActiveProviders(void) { return gDateLyricsMusixmatchEnabled ? gDateLyricsProviderOrder : @[]; }
@@ -264,9 +269,16 @@ static int DLCLockCache(NSString *root) {
     return lock;
 }
 static void DLCUnlockCache(int lock) { flock(lock, LOCK_UN); close(lock); }
-static BOOL DLCWriteCache(DLLyricsTrack *track, DLLyricsResult *result, BOOL preserveSaved) {
+static NSString *DLCCacheEpoch(void) {
+    return [NSString stringWithContentsOfFile:[DLCCacheRoot() stringByAppendingPathComponent:@".fetch-generation"] encoding:NSUTF8StringEncoding error:nil] ?: @"0";
+}
+static void DLCAdvanceCacheEpoch(void) {
+    [NSUUID.UUID.UUIDString writeToFile:[DLCCacheRoot() stringByAppendingPathComponent:@".fetch-generation"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+}
+static BOOL DLCWriteCacheForEpoch(DLLyricsTrack *track, DLLyricsResult *result, BOOL preserveSaved, NSString *epoch) {
     int lock = DLCLockCache(DLCCacheRoot());
     if (lock < 0) return NO;
+    if (epoch && ![epoch isEqual:DLCCacheEpoch()]) { DLCUnlockCache(lock); return NO; }
     DLLyricsResult *existing = DLCReadCache(track);
     if (preserveSaved && existing.savedOffline) result.savedOffline = YES;
     if (existing.hasWordTiming && !result.hasWordTiming) {
@@ -281,14 +293,19 @@ static BOOL DLCWriteCache(DLLyricsTrack *track, DLLyricsResult *result, BOOL pre
     DLCUnlockCache(lock);
     return written;
 }
+static BOOL DLCWriteCache(DLLyricsTrack *track, DLLyricsResult *result, BOOL preserveSaved) {
+    return DLCWriteCacheForEpoch(track, result, preserveSaved, nil);
+}
 static void DLCNotify(DLCoreLookup *lookup, BOOL finished, NSError *error) {
     DLLyricsResult *result = lookup.result;
     for (DLLyricsUpdate update in lookup.subscribers.allValues)
         dispatch_async(dispatch_get_main_queue(), ^{ update(result, finished, error); });
 }
+#include "SharedLookup.inc"
 static BOOL DLCPublishLines(NSInteger lookupID, NSArray<DLCoreLine *> *lines, BOOL relaxed) {
     DLCoreLookup *lookup = gLookupIDs[@(lookupID)];
-    if (!lookup || !lookup.subscribers.count) return NO;
+    if (!lookup || !DLCSharedHasConsumers(lookup)) return NO;
+    if (![lookup.cacheEpoch isEqual:DLCCacheEpoch()]) { DLCSharedAbort(lookup); return NO; }
     NSMutableArray *serialized = [NSMutableArray array];
     for (DLCoreLine *line in lines) {
         NSMutableDictionary *item = [@{@"begin":@(line.begin), @"end":@(line.end), @"text":line.text ?: @""} mutableCopy];
@@ -307,6 +324,12 @@ static BOOL DLCPublishLines(NSInteger lookupID, NSArray<DLCoreLine *> *lines, BO
     lookup.result = result;
     lookup.hasPublishedLines = YES;
     DLCPerformance(result.hasWordTiming ? @"word-upgrade" : @"first-lines", lookup);
+    BOOL written = DLCWriteCacheForEpoch(lookup.track, result, YES, lookup.cacheEpoch);
+    if (!written && ![lookup.cacheEpoch isEqual:DLCCacheEpoch()]) { DLCSharedAbort(lookup); return NO; }
+    if (written) {
+        DLCSharedPublish(lookup, NO, nil);
+        CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(), CFSTR("com.shalamand3r.corelyrics/CacheUpdated"), NULL, NULL, YES);
+    }
     DLCNotify(lookup, NO, nil);
     for (DLCoreProviderTask *task in lookup.tasks.allValues) {
         task.hasUsableLines = YES;
@@ -314,8 +337,6 @@ static BOOL DLCPublishLines(NSInteger lookupID, NSArray<DLCoreLine *> *lines, BO
     }
     DLCProviderHealthy(result.provider);
     if (result.hasWordTiming) DLCCompleteLookup(lookup, nil);
-    if (DLCWriteCache(lookup.track, result, YES))
-        CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(), CFSTR("com.shalamand3r.corelyrics/CacheUpdated"), NULL, NULL, YES);
     static NSTimeInterval nextPrune;
     if (NSDate.date.timeIntervalSince1970 >= nextPrune) {
         nextPrune = NSDate.date.timeIntervalSince1970 + 3600;
@@ -341,10 +362,11 @@ static void DLCCancelLookup(DLCoreLookup *lookup) {
         [gLookupIDs removeObjectForKey:@(task.storeID)];
     }
     [lookup.tasks removeAllObjects];
+    DLCSharedClose(lookup);
     [gLookups removeObjectForKey:lookup.track.cacheKey];
 }
 static BOOL DLCScheduleRetry(DLCoreLookup *lookup) {
-    if (lookup.retryRound >= 2 || !lookup.retryProviders.count || lookup.result.hasWordTiming || !lookup.subscribers.count) return NO;
+    if (lookup.retryRound >= 2 || !lookup.retryProviders.count || lookup.result.hasWordTiming || !DLCSharedHasConsumers(lookup)) return NO;
     NSMutableArray<NSString *> *providers = [NSMutableArray array];
     NSTimeInterval now = CACurrentMediaTime(), earliest = DBL_MAX;
     for (NSString *provider in lookup.providers) {
@@ -365,7 +387,7 @@ static BOOL DLCScheduleRetry(DLCoreLookup *lookup) {
     __weak DLCoreLookup *weakLookup = lookup;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(MIN(delay, 86400.0) * NSEC_PER_SEC)), gLyricsQueue, ^{
         DLCoreLookup *active = weakLookup;
-        if (!active || gLookups[active.track.cacheKey] != active || !active.subscribers.count) return;
+        if (!active || gLookups[active.track.cacheKey] != active || !DLCSharedHasConsumers(active)) return;
         active.waitingForRetry = NO; active.expandedWindow = NO;
         DLLyricsResult *cached = DLCReadCache(active.track);
         if (cached && (cached.hasWordTiming || !active.result)) {
@@ -381,6 +403,7 @@ static BOOL DLCScheduleRetry(DLCoreLookup *lookup) {
 static void DLCCompleteLookup(DLCoreLookup *lookup, NSString *reason) {
     if (!lookup || gLookups[lookup.track.cacheKey] != lookup) return;
     if (lookup.waitingForRetry || DLCScheduleRetry(lookup)) return;
+    DLCSharedPublish(lookup, YES, reason);
     if (reason.length && !lookup.result) {
         if (lookup.hadTransportFailure) [gRetryAfter removeObjectForKey:lookup.track.cacheKey];
         else gRetryAfter[lookup.track.cacheKey] = @(NSDate.date.timeIntervalSince1970 + 900);
@@ -406,7 +429,7 @@ static void DLCArmHedge(DLCoreLookup *lookup) {
     });
 }
 static void DLCFillProviders(DLCoreLookup *lookup) {
-    if (gLookups[lookup.track.cacheKey] != lookup || lookup.waitingForRetry) return;
+    if (gLookups[lookup.track.cacheKey] != lookup || lookup.waitingForRetry || DLCSharedIsFollower(lookup)) return;
     // keep existing word requests, but give their fast upgrade a head start before adding more.
     NSUInteger limit = lookup.expandedWindow ? 3 : (lookup.hasPublishedLines ? 1 : 2);
     while (lookup.tasks.count < limit && lookup.nextProvider < lookup.providers.count) {
@@ -415,7 +438,8 @@ static void DLCFillProviders(DLCoreLookup *lookup) {
         DLCoreProviderTask *task = [DLCoreProviderTask new]; task.storeID = ++gNextLookupID;
         task.title = lookup.track.title; task.artist = lookup.track.artist; task.album = lookup.track.album;
         task.duration = lookup.track.duration;
-        task.appleTier = lookup.track.hasNativeLineTiming ? DateLyricsSyncTierLine : DateLyricsSyncTierNone;
+        // each consumer decides whether external lines improve its own apple result.
+        task.appleTier = DateLyricsSyncTierNone;
         task.hasUsableLines = lookup.result.lines.count > 0; task.hasWordTiming = lookup.result.hasWordTiming;
         task.musixmatchGeneration = gDateLyricsMusixmatchGeneration; task.taskID = NSUUID.UUID.UUIDString;
         task.provider = provider;
@@ -510,7 +534,7 @@ static void DLCInvalidateLookups(void) {
     [gMusixmatchPendingTaskIDs removeAllObjects]; [gMusixmatchTokenWaiters removeAllObjects];
     gMusixmatchTokenRequestInFlight = NO;
     NSError *error = [NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorCancelled userInfo:nil];
-    for (DLCoreLookup *lookup in gLookups.allValues) { lookup.result = nil; DLCNotify(lookup, YES, error); }
+    for (DLCoreLookup *lookup in gLookups.allValues) { DLCSharedClose(lookup); lookup.result = nil; DLCNotify(lookup, YES, error); }
     [gLookups removeAllObjects]; [gLookupIDs removeAllObjects]; [gRetryAfter removeAllObjects];
 }
 static void DLCClearCacheFiles(NSString *root, BOOL keepSaved) {
@@ -538,12 +562,14 @@ static void DLCApplyRequestedCacheReset(void) {
     NSDictionary *state = [NSDictionary dictionaryWithContentsOfFile:marker];
     NSUInteger processed = state ? DLCCacheGeneration(state[@"generation"]) :
         DLCCacheGeneration(DLCPreference(@"MusicProcessedCacheGeneration"));
-    if (requested > processed) {
-        DLCInvalidateLookups();
+    BOOL reset = requested > processed;
+    if (reset) {
+        DLCAdvanceCacheEpoch();
         DLCClearCacheFiles(root, NO);
     }
     [@{@"generation":@(MAX(requested, processed))} writeToFile:marker atomically:YES];
     DLCUnlockCache(lock);
+    if (reset) DLCInvalidateLookups();
 }
 static void DLCCacheResetRequested(CFNotificationCenterRef center, void *observer, CFStringRef name, const void *object, CFDictionaryRef info) {
     [DLLyricsEngine.sharedEngine reloadPreferences];
@@ -557,6 +583,7 @@ static void DLCCacheResetRequested(CFNotificationCenterRef center, void *observe
         gLookups = [NSMutableDictionary dictionary]; gLookupIDs = [NSMutableDictionary dictionary]; gRetryAfter = [NSMutableDictionary dictionary];
         gMusixmatchPendingTaskIDs = [NSMutableDictionary dictionary]; gMusixmatchTokenWaiters = [NSMutableArray array];
         DLCLoadPreferences();
+        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL, DLCSharedChanged, CFSTR("com.shalamand3r.corelyrics/LookupUpdated"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
         dispatch_async(gLyricsQueue, ^{ DLCApplyRequestedCacheReset(); });
         CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL, DLCCacheResetRequested, CFSTR("com.shalamand3r.datelyrics/ClearCaches"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
         CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL, DLCPreferencesChanged, CFSTR("com.shalamand3r.datelyrics/ReloadPrefs"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
@@ -581,11 +608,13 @@ static void DLCCacheResetRequested(CFNotificationCenterRef center, void *observe
             if (!lookup) return;
             [lookup.subscribers removeObjectForKey:token];
             if (!lookup.subscribers.count) {
-                DLCCancelLookup(lookup);
+                DLCSharedDropParticipant(lookup);
+                if (!DLCSharedHasConsumers(lookup)) DLCCancelLookup(lookup);
             }
         });
     };
     dispatch_async(gLyricsQueue, ^{
+        NSTimeInterval requestedAt = CACurrentMediaTime();
         DLLyricsSubscription *active = weakSubscription;
         @synchronized (active) { if (!active.cancellation) return; }
         if (!DateLyricsMusixmatchNormalizedString(selection.title).length || !DateLyricsMusixmatchNormalizedString(selection.artist).length) {
@@ -594,11 +623,8 @@ static void DLCCacheResetRequested(CFNotificationCenterRef center, void *observe
         }
         DLCoreLookup *lookup = gLookups[key];
         if (lookup) {
-            if (selection.hasNativeLineTiming) {
-                lookup.track.hasNativeLineTiming = YES;
-                for (DLCoreProviderTask *task in lookup.tasks.allValues) task.appleTier = DateLyricsSyncTierLine;
-            }
             lookup.subscribers[token] = delivery;
+            DLCSharedAddParticipant(lookup);
             if (lookup.result) dispatch_async(dispatch_get_main_queue(), ^{ delivery(lookup.result, NO, nil); });
             return;
         }
@@ -610,15 +636,14 @@ static void DLCCacheResetRequested(CFNotificationCenterRef center, void *observe
         if ([gRetryAfter[key] doubleValue] > NSDate.date.timeIntervalSince1970 || !gDateLyricsMusixmatchEnabled) {
             dispatch_async(dispatch_get_main_queue(), ^{ delivery(cached, YES, cached ? nil : [NSError errorWithDomain:@"CoreLyrics" code:3 userInfo:@{NSLocalizedDescriptionKey:@"No cached lyrics are available."}]); }); return;
         }
-        lookup = [DLCoreLookup new]; lookup.startedAt = CACurrentMediaTime(); lookup.startedCPU = gPerformanceLogging ? DLCProcessCPU() : 0; lookup.track = selection; lookup.result = cached;
+        lookup = [DLCoreLookup new]; lookup.startedAt = requestedAt; lookup.startedCPU = gPerformanceLogging ? DLCProcessCPU() : 0; lookup.track = selection; lookup.result = cached;
         DLCPerformance(@"lookup-start", lookup);
         lookup.subscribers = [NSMutableDictionary dictionaryWithObject:delivery forKey:token];
         lookup.retryProviders = [NSMutableSet set];
         lookup.tasks = [NSMutableDictionary dictionary]; lookup.providers = [DateLyricsActiveProviders() copy];
         gLookups[key] = lookup;
         if (cached) DLCNotify(lookup, NO, nil);
-        DLCArmHedge(lookup);
-        DLCFillProviders(lookup);
+        DLCSharedStart(lookup);
     });
     return subscription;
 }
@@ -662,6 +687,7 @@ static void DLCCacheResetRequested(CFNotificationCenterRef center, void *observe
         NSString *root = DLCCacheRoot();
         int lock = DLCLockCache(root);
         if (lock < 0) { dispatch_async(dispatch_get_main_queue(), completion); return; }
+        DLCAdvanceCacheEpoch();
         DLCClearCacheFiles(root, keepSaved);
         DLCUnlockCache(lock);
         dispatch_async(dispatch_get_main_queue(), completion);
