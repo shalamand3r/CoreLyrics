@@ -1,6 +1,6 @@
 Package: com.shalamand3r.corelyrics
 Name: CoreLyrics
-Version: 1.0.4
+Version: 1.0.5
 Architecture: iphoneos-arm64
 Description: Shared lyric fetching and offline storage for DateLyrics and LyricBridge.
 Depends: firmware (>= 16.0)

@@ -42,6 +42,9 @@
 @property (nonatomic) BOOL expandedWindow;
 @property (nonatomic) NSUInteger requestCount;
 @property (nonatomic) BOOL hasPublishedLines;
+@property (nonatomic) BOOL waitingForRetry;
+@property (nonatomic) NSUInteger retryRound;
+@property (nonatomic, strong) NSMutableSet<NSString *> *retryProviders;
 @property (nonatomic) NSUInteger hedgeGeneration;
 @property (nonatomic) BOOL hadTransportFailure;
 @property (nonatomic, copy) NSString *failureReason;
@@ -203,10 +206,10 @@ static double DLCProcessCPU(void) {
 static void DLCPerformance(NSString *event, DLCoreLookup *lookup) {
     if (!gPerformanceLogging) return;
     CLDiagnosticAppend(DLCCacheRoot(), @"CoreLyrics", YES,
-        [NSString stringWithFormat:@"event=%@ elapsed=%.3f activeProviders=%lu subscribers=%lu lines=%lu words=%d requests=%lu processCpuDelta=%.6f", event,
+        [NSString stringWithFormat:@"event=%@ elapsed=%.3f activeProviders=%lu subscribers=%lu lines=%lu words=%d requests=%lu retries=%lu processCpuDelta=%.6f", event,
             lookup.startedAt > 0 ? CACurrentMediaTime() - lookup.startedAt : 0,
             (unsigned long)lookup.tasks.count, (unsigned long)lookup.subscribers.count,
-            (unsigned long)lookup.result.lines.count, lookup.result.hasWordTiming, (unsigned long)lookup.requestCount, lookup.startedCPU > 0 ? MAX(0, DLCProcessCPU()-lookup.startedCPU) : 0]);
+            (unsigned long)lookup.result.lines.count, lookup.result.hasWordTiming, (unsigned long)lookup.requestCount, (unsigned long)lookup.retryRound, lookup.startedCPU > 0 ? MAX(0, DLCProcessCPU()-lookup.startedCPU) : 0]);
 }
 static NSArray *DLCValidatedLines(id raw) {
     if (![raw isKindOfClass:NSArray.class] || ![raw count] || [raw count] > 4000) return nil;
@@ -340,10 +343,48 @@ static void DLCCancelLookup(DLCoreLookup *lookup) {
     [lookup.tasks removeAllObjects];
     [gLookups removeObjectForKey:lookup.track.cacheKey];
 }
+static BOOL DLCScheduleRetry(DLCoreLookup *lookup) {
+    if (lookup.retryRound >= 2 || !lookup.retryProviders.count || lookup.result.hasWordTiming || !lookup.subscribers.count) return NO;
+    NSMutableArray<NSString *> *providers = [NSMutableArray array];
+    NSTimeInterval now = CACurrentMediaTime(), earliest = DBL_MAX;
+    for (NSString *provider in lookup.providers) {
+        if (![lookup.retryProviders containsObject:provider]) continue;
+        if (lookup.result.lines.count && !DateLyricsProviderHasWordTiming(provider)) continue;
+        [providers addObject:provider];
+        DLCProviderHealth *health = DLCHealth(provider);
+        earliest = MIN(earliest, MAX(now, health.retryAt));
+    }
+    if (!providers.count) return NO;
+    NSTimeInterval delay = MAX(lookup.retryRound ? 8 : 2, earliest - now);
+    lookup.waitingForRetry = YES;
+    ++lookup.retryRound; ++lookup.hedgeGeneration;
+    lookup.providers = providers; lookup.nextProvider = 0;
+    [lookup.retryProviders removeAllObjects];
+    DateLyricsDebugLog(@"[Lookup:RETRY] scheduled round=%lu providers=%lu delay=%.1fs", (unsigned long)lookup.retryRound, (unsigned long)providers.count, delay);
+    DLCPerformance(@"retry-scheduled", lookup);
+    __weak DLCoreLookup *weakLookup = lookup;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(MIN(delay, 86400.0) * NSEC_PER_SEC)), gLyricsQueue, ^{
+        DLCoreLookup *active = weakLookup;
+        if (!active || gLookups[active.track.cacheKey] != active || !active.subscribers.count) return;
+        active.waitingForRetry = NO; active.expandedWindow = NO;
+        DLLyricsResult *cached = DLCReadCache(active.track);
+        if (cached && (cached.hasWordTiming || !active.result)) {
+            active.result = cached; active.hasPublishedLines = YES;
+            DLCNotify(active, NO, nil);
+            if (cached.hasWordTiming) { DLCCompleteLookup(active, nil); return; }
+        }
+        DLCPerformance(@"retry-start", active);
+        DLCArmHedge(active); DLCFillProviders(active);
+    });
+    return YES;
+}
 static void DLCCompleteLookup(DLCoreLookup *lookup, NSString *reason) {
     if (!lookup || gLookups[lookup.track.cacheKey] != lookup) return;
-    if (reason.length && !lookup.result)
-        gRetryAfter[lookup.track.cacheKey] = @(NSDate.date.timeIntervalSince1970 + (lookup.hadTransportFailure ? 30 : 900));
+    if (lookup.waitingForRetry || DLCScheduleRetry(lookup)) return;
+    if (reason.length && !lookup.result) {
+        if (lookup.hadTransportFailure) [gRetryAfter removeObjectForKey:lookup.track.cacheKey];
+        else gRetryAfter[lookup.track.cacheKey] = @(NSDate.date.timeIntervalSince1970 + 900);
+    }
     NSError *error = reason.length && !lookup.result ? [NSError errorWithDomain:@"CoreLyrics" code:1 userInfo:@{NSLocalizedDescriptionKey:reason}] : nil;
     DLCPerformance(error ? @"finished-no-result" : @"finished", lookup);
     DateLyricsDebugLog(@"[Lookup:FINISH] result=%d transportFailure=%d", lookup.result != nil, lookup.hadTransportFailure);
@@ -365,7 +406,7 @@ static void DLCArmHedge(DLCoreLookup *lookup) {
     });
 }
 static void DLCFillProviders(DLCoreLookup *lookup) {
-    if (gLookups[lookup.track.cacheKey] != lookup) return;
+    if (gLookups[lookup.track.cacheKey] != lookup || lookup.waitingForRetry) return;
     // keep existing word requests, but give their fast upgrade a head start before adding more.
     NSUInteger limit = lookup.expandedWindow ? 3 : (lookup.hasPublishedLines ? 1 : 2);
     while (lookup.tasks.count < limit && lookup.nextProvider < lookup.providers.count) {
@@ -380,6 +421,7 @@ static void DLCFillProviders(DLCoreLookup *lookup) {
         task.provider = provider;
         if (!DLCProviderAcquire(provider, task.taskID)) {
             lookup.hadTransportFailure = YES;
+            [lookup.retryProviders addObject:provider];
             DateLyricsDebugLog(@"[Provider:COOLDOWN] skipped provider=%@", provider);
             continue;
         }
@@ -396,6 +438,7 @@ static void DLCFinishTask(DLCoreProviderTask *task, NSString *reason) {
     DLCoreLookup *lookup = gLookupIDs[@(task.storeID)];
     DateLyricsDebugLog(@"[Provider:FINISH] request=%ld provider=%@ failed=%d transportFailure=%d", (long)task.storeID, task.provider, reason.length > 0, task.hadTransportFailure);
     lookup.hadTransportFailure |= task.hadTransportFailure;
+    if (task.hadTransportFailure) [lookup.retryProviders addObject:task.provider];
     if (!task.hadTransportFailure) DLCProviderHealthy(task.provider);
     if (reason.length) lookup.failureReason = reason;
     DateLyricsCancelProviderLookup(task.storeID);
@@ -570,6 +613,7 @@ static void DLCCacheResetRequested(CFNotificationCenterRef center, void *observe
         lookup = [DLCoreLookup new]; lookup.startedAt = CACurrentMediaTime(); lookup.startedCPU = gPerformanceLogging ? DLCProcessCPU() : 0; lookup.track = selection; lookup.result = cached;
         DLCPerformance(@"lookup-start", lookup);
         lookup.subscribers = [NSMutableDictionary dictionaryWithObject:delivery forKey:token];
+        lookup.retryProviders = [NSMutableSet set];
         lookup.tasks = [NSMutableDictionary dictionary]; lookup.providers = [DateLyricsActiveProviders() copy];
         gLookups[key] = lookup;
         if (cached) DLCNotify(lookup, NO, nil);

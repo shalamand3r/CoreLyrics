@@ -29,11 +29,15 @@ static NSTimeInterval DLCRetryDelay(NSString *value) {
 }
 static void DLCProviderFailed(NSString *provider, NSHTTPURLResponse *response) {
     DLCProviderHealth *health = DLCHealth(provider);
-    health.failures = MIN(health.failures + 1, 2);
+    health.failures = MIN(health.failures + 1, 7);
     NSString *retryAfter;
     for (NSString *key in response.allHeaderFields)
         if ([key caseInsensitiveCompare:@"Retry-After"] == NSOrderedSame) retryAfter = [response.allHeaderFields[key] description];
-    NSTimeInterval delay = MAX(DLCRetryDelay(retryAfter), health.failures >= 2 ? 300 : 0);
+    BOOL rateLimited = response.statusCode == 429;
+    NSUInteger exponent = health.failures > 1 ? health.failures - (rateLimited ? 1 : 2) : 0;
+    NSTimeInterval backoff = rateLimited ? 15 : (health.failures >= 2 ? 30 : 0);
+    backoff = MIN(300, backoff * (1UL << exponent));
+    NSTimeInterval delay = MAX(DLCRetryDelay(retryAfter), backoff);
     if (delay > 0) health.retryAt = MAX(health.retryAt, CACurrentMediaTime() + delay);
     DateLyricsDebugLog(@"[Provider:HEALTH] provider=%@ failures=%lu cooldown=%.0fs", provider, (unsigned long)health.failures, delay);
 }
