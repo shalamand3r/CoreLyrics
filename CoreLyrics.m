@@ -66,7 +66,7 @@ static BOOL gDateLyricsDebugLogging = NO;
 static BOOL gPerformanceLogging;
 static BOOL gDateLyricsMusixmatchEnabled = YES, gDateLyricsWordHighlighting = YES;
 static BOOL gDateLyricsRelaxedMatching;
-static NSInteger gDateLyricsRequestTimeout = 10;
+static NSInteger gDateLyricsRequestTimeout = DateLyricsDefaultRequestTimeout;
 static NSArray<NSString *> *gDateLyricsProviderOrder;
 static NSDictionary *gSavedProviderPreferences;
 
