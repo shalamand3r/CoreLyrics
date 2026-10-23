@@ -39,7 +39,9 @@
 @property (nonatomic) NSUInteger nextProvider;
 @property (nonatomic) NSTimeInterval startedAt;
 @property (nonatomic) double startedCPU;
-@property (nonatomic) BOOL parallelReady;
+@property (nonatomic) BOOL expandedWindow;
+@property (nonatomic) NSUInteger requestCount;
+@property (nonatomic) BOOL hasPublishedLines;
 @property (nonatomic) NSUInteger hedgeGeneration;
 @property (nonatomic) BOOL hadTransportFailure;
 @property (nonatomic, copy) NSString *failureReason;
@@ -84,6 +86,7 @@ static void DateLyricsAssignCharacterRanges(DLCoreLine *line) { (void)line; }
 static BOOL DateLyricsMusixmatchServiceEnabled(void) { return [gDateLyricsProviderOrder containsObject:@"musixmatch"]; }
 static NSArray *DateLyricsActiveProviders(void) { return gDateLyricsMusixmatchEnabled ? gDateLyricsProviderOrder : @[]; }
 #include "ProviderText.inc"
+#include "ProviderHealth.inc"
 #include "ProviderPipeline.inc"
 
 @implementation DLLyricsTrack
@@ -200,10 +203,10 @@ static double DLCProcessCPU(void) {
 static void DLCPerformance(NSString *event, DLCoreLookup *lookup) {
     if (!gPerformanceLogging) return;
     CLDiagnosticAppend(DLCCacheRoot(), @"CoreLyrics", YES,
-        [NSString stringWithFormat:@"event=%@ elapsed=%.3f activeProviders=%lu subscribers=%lu lines=%lu words=%d processCpuDelta=%.6f", event,
+        [NSString stringWithFormat:@"event=%@ elapsed=%.3f activeProviders=%lu subscribers=%lu lines=%lu words=%d requests=%lu processCpuDelta=%.6f", event,
             lookup.startedAt > 0 ? CACurrentMediaTime() - lookup.startedAt : 0,
             (unsigned long)lookup.tasks.count, (unsigned long)lookup.subscribers.count,
-            (unsigned long)lookup.result.lines.count, lookup.result.hasWordTiming, lookup.startedCPU > 0 ? MAX(0, DLCProcessCPU()-lookup.startedCPU) : 0]);
+            (unsigned long)lookup.result.lines.count, lookup.result.hasWordTiming, (unsigned long)lookup.requestCount, lookup.startedCPU > 0 ? MAX(0, DLCProcessCPU()-lookup.startedCPU) : 0]);
 }
 static NSArray *DLCValidatedLines(id raw) {
     if (![raw isKindOfClass:NSArray.class] || ![raw count] || [raw count] > 4000) return nil;
@@ -299,12 +302,14 @@ static BOOL DLCPublishLines(NSInteger lookupID, NSArray<DLCoreLine *> *lines, BO
     for (NSDictionary *line in valid) result.hasWordTiming |= [line[@"words"] count] > 0;
     if (lookup.result.hasWordTiming || (lookup.result && !result.hasWordTiming)) return NO;
     lookup.result = result;
+    lookup.hasPublishedLines = YES;
     DLCPerformance(result.hasWordTiming ? @"word-upgrade" : @"first-lines", lookup);
     DLCNotify(lookup, NO, nil);
     for (DLCoreProviderTask *task in lookup.tasks.allValues) {
         task.hasUsableLines = YES;
         task.hasWordTiming = result.hasWordTiming;
     }
+    DLCProviderHealthy(result.provider);
     if (result.hasWordTiming) DLCCompleteLookup(lookup, nil);
     if (DLCWriteCache(lookup.track, result, YES))
         CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(), CFSTR("com.shalamand3r.corelyrics/CacheUpdated"), NULL, NULL, YES);
@@ -347,21 +352,22 @@ static void DLCCompleteLookup(DLCoreLookup *lookup, NSString *reason) {
     [lookup.subscribers removeAllObjects];
 }
 static void DLCArmHedge(DLCoreLookup *lookup) {
-    lookup.parallelReady = NO;
+    if (lookup.expandedWindow) return;
     NSUInteger generation = ++lookup.hedgeGeneration;
     __weak DLCoreLookup *weakLookup = lookup;
-    // let a fast preferred result or an in-progress word upgrade finish first.
+    // two providers start immediately; a third joins only if work is still pending.
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 350 * NSEC_PER_MSEC), gLyricsQueue, ^{
         DLCoreLookup *active = weakLookup;
         if (!active || gLookups[active.track.cacheKey] != active || active.hedgeGeneration != generation) return;
         DLCPerformance(@"start-overlap", active);
-        active.parallelReady = YES;
+        active.expandedWindow = YES;
         DLCFillProviders(active);
     });
 }
 static void DLCFillProviders(DLCoreLookup *lookup) {
     if (gLookups[lookup.track.cacheKey] != lookup) return;
-    NSUInteger limit = lookup.parallelReady ? 2 : 1;
+    // keep existing word requests, but give their fast upgrade a head start before adding more.
+    NSUInteger limit = lookup.expandedWindow ? 3 : (lookup.hasPublishedLines ? 1 : 2);
     while (lookup.tasks.count < limit && lookup.nextProvider < lookup.providers.count) {
         NSString *provider = lookup.providers[lookup.nextProvider++];
         if (lookup.result.lines.count && !DateLyricsProviderHasWordTiming(provider)) continue;
@@ -372,6 +378,11 @@ static void DLCFillProviders(DLCoreLookup *lookup) {
         task.hasUsableLines = lookup.result.lines.count > 0; task.hasWordTiming = lookup.result.hasWordTiming;
         task.musixmatchGeneration = gDateLyricsMusixmatchGeneration; task.taskID = NSUUID.UUID.UUIDString;
         task.provider = provider;
+        if (!DLCProviderAcquire(provider, task.taskID)) {
+            lookup.hadTransportFailure = YES;
+            DateLyricsDebugLog(@"[Provider:COOLDOWN] skipped provider=%@", provider);
+            continue;
+        }
         lookup.tasks[@(task.storeID)] = task; gLookupIDs[@(task.storeID)] = lookup;
         gMusixmatchPendingTaskIDs[@(task.storeID)] = task.taskID;
         DateLyricsStartProvider(task);
@@ -385,6 +396,7 @@ static void DLCFinishTask(DLCoreProviderTask *task, NSString *reason) {
     DLCoreLookup *lookup = gLookupIDs[@(task.storeID)];
     DateLyricsDebugLog(@"[Provider:FINISH] request=%ld provider=%@ failed=%d transportFailure=%d", (long)task.storeID, task.provider, reason.length > 0, task.hadTransportFailure);
     lookup.hadTransportFailure |= task.hadTransportFailure;
+    if (!task.hadTransportFailure) DLCProviderHealthy(task.provider);
     if (reason.length) lookup.failureReason = reason;
     DateLyricsCancelProviderLookup(task.storeID);
     [lookup.tasks removeObjectForKey:@(task.storeID)]; [gLookupIDs removeObjectForKey:@(task.storeID)];
@@ -451,6 +463,7 @@ static void DLCPruneCache(void) {
 static void DLCInvalidateLookups(void) {
     ++gDateLyricsMusixmatchGeneration; ++gTokenGeneration;
     DateLyricsCancelAllProviderRequests();
+    for (DLCProviderHealth *health in gProviderHealth.allValues) health.probeID = nil;
     [gMusixmatchPendingTaskIDs removeAllObjects]; [gMusixmatchTokenWaiters removeAllObjects];
     gMusixmatchTokenRequestInFlight = NO;
     NSError *error = [NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorCancelled userInfo:nil];

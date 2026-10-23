@@ -42,6 +42,16 @@ static void DateLyricsMusixmatchRequest(DateLyricsMusixmatchTask *owner, NSStrin
     NSString *requestKey = owner.taskID ?: @"token";
     DateLyricsCancelProviderRequest(requestKey);
     NSInteger timeout = gDateLyricsRequestTimeout;
+    if (owner) {
+        ++gLookupIDs[@(owner.storeID)].requestCount;
+    } else {
+        NSMutableSet<DLCoreLookup *> *requestLookups = [NSMutableSet set];
+        for (DLCoreProviderTask *task in gMusixmatchTokenWaiters) {
+            DLCoreLookup *lookup = gLookupIDs[@(task.storeID)];
+            if (lookup) [requestLookups addObject:lookup];
+        }
+        for (DLCoreLookup *lookup in requestLookups) ++lookup.requestCount;
+    }
     CFTimeInterval startedAt = (gDateLyricsDebugLogging || gPerformanceLogging) ? CACurrentMediaTime() : 0.0;
     DateLyricsDebugLog(@"[Provider:HTTP] begin host=%@ timeout=%@", url.host ?: @"?", DateLyricsRequestTimeoutLabel(timeout));
     NSMutableURLRequest *request = DateLyricsProviderURLRequest(url);
@@ -67,7 +77,15 @@ static void DateLyricsMusixmatchRequest(DateLyricsMusixmatchTask *owner, NSStrin
                                startedAt > 0.0 ? CACurrentMediaTime() - startedAt : -1.0,
                                (long)resultError.code);
             if (gPerformanceLogging) CLDiagnosticAppend(DLCCacheRoot(), @"CoreLyrics", YES, [NSString stringWithFormat:@"event=http-finish host=%@ status=%ld bytes=%lu seconds=%.3f errorCode=%ld", url.host, (long)http.statusCode, (unsigned long)data.length, CACurrentMediaTime() - startedAt, (long)resultError.code]);
-            if (owner && (resultError || http.statusCode == 429 || http.statusCode >= 500)) owner.hadTransportFailure = YES;
+            if (resultError || http.statusCode == 429 || http.statusCode >= 500) {
+                NSArray *affected = owner ? @[owner] : [gMusixmatchTokenWaiters copy];
+                DLCProviderFailed(owner.provider ?: @"musixmatch", http);
+                for (DLCoreProviderTask *task in affected) task.hadTransportFailure = YES;
+                if (owner) {
+                    DLCFinishTask(owner, @"Provider temporarily unavailable");
+                    return;
+                }
+            }
             if (completion) completion(expired ? nil : data, http.statusCode, resultError);
         });
     }];
@@ -912,6 +930,9 @@ static BOOL DateLyricsMusixmatchTaskIsCurrent(DateLyricsMusixmatchTask *task) {
 }
 
 static void DateLyricsCancelProviderLookup(NSInteger storeID) {
+    DLCoreLookup *lookup = gLookupIDs[@(storeID)];
+    DLCoreProviderTask *task = lookup.tasks[@(storeID)];
+    if (task) DLCProviderRelease(task);
     DateLyricsCancelProviderRequest(gMusixmatchPendingTaskIDs[@(storeID)]);
     [gMusixmatchPendingTaskIDs removeObjectForKey:@(storeID)];
     for (DateLyricsMusixmatchTask *waiter in [gMusixmatchTokenWaiters copy])
