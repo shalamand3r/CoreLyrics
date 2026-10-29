@@ -99,10 +99,12 @@ static void DateLyricsBeginSharedLookup(DateLyricsMusixmatchTask *task) {
                 DateLyricsScore *cached = DateLyricsScoreAtPath(DateLyricsMusixmatchScorePath(task.storeID));
                 BOOL wins = !apple.hasWordTiming && (!apple.lines.count || result.hasWordTiming) &&
                     (!cached.hasWordTiming || result.hasWordTiming);
-                if (wins && (result.hasWordTiming || !task.hasUsableLines)) {
-                    task.hasUsableLines = YES; task.hasWordTiming = result.hasWordTiming;
-                    DateLyricsWriteScoreJSON(task.storeID, result.lines, result.hasWordTiming,
-                        result.relaxedMatch ? @"musixmatch-relaxed" : @"musixmatch");
+                // progress and completion can deliver the same word result; publish it once.
+                if (wins && (!task.hasUsableLines || (result.hasWordTiming && !task.hasWordTiming))) {
+                    if (DateLyricsWriteScoreJSON(task.storeID, result.lines, result.hasWordTiming,
+                            result.relaxedMatch ? @"musixmatch-relaxed" : @"musixmatch")) {
+                        task.hasUsableLines = YES; task.hasWordTiming = result.hasWordTiming;
+                    }
                 }
             }
             if (!finished && task.hasUsableLines && !gDateLyricsWordHighlighting) {

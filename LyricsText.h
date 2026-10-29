@@ -2,6 +2,17 @@
 #import <Foundation/Foundation.h>
 static NSString *DateLyricsMusixmatchNormalizedString(NSString *value) {
     if (![value isKindOfClass:NSString.class]) return @"";
+    static NSCache<NSString *, NSString *> *cache;
+    static NSLocale *locale;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        cache = [NSCache new];
+        cache.countLimit = 256;
+        cache.totalCostLimit = 128 * 1024;
+        locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+    });
+    NSString *cached = [cache objectForKey:value];
+    if (cached) return cached;
     // expand & and + to "and" before folding so that e.g.
     // "simon & garfunkel" and "simon and garfunkel" normalise identically.
     NSMutableString *prep = [value mutableCopy];
@@ -9,7 +20,7 @@ static NSString *DateLyricsMusixmatchNormalizedString(NSString *value) {
     [prep replaceOccurrencesOfString:@"+" withString:@" and " options:0 range:NSMakeRange(0, prep.length)];
     NSString *normalized = [prep stringByFoldingWithOptions:
         NSCaseInsensitiveSearch | NSDiacriticInsensitiveSearch | NSWidthInsensitiveSearch
-        locale:[NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"]];
+        locale:locale];
     NSMutableString *result = [NSMutableString string];
     NSCharacterSet *alphanumeric = [NSCharacterSet alphanumericCharacterSet];
     __block BOOL needsSpace = NO;
@@ -27,7 +38,11 @@ static NSString *DateLyricsMusixmatchNormalizedString(NSString *value) {
             needsSpace = YES;
         }
     }];
-    return result;
+    NSString *output = [result copy];
+    // cap retained metadata and copy keys because callers can pass mutable strings.
+    if (value.length <= 1024)
+        [cache setObject:output forKey:[value copy] cost:(value.length + output.length) * sizeof(unichar)];
+    return output;
 }
 
 static BOOL DateLyricsTextsAreSimilar(NSString *left, NSString *right) {
